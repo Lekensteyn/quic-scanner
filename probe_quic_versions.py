@@ -2,7 +2,7 @@
 # Probe UDP servers for supported QUIC versions using multiple methods.
 #
 # Copyright 2020 Peter Wu <peter@lekensteyn.nl>
-# Licensed under the MIT license <http://opensource.org/licenses/MIT>.
+# Licensed under the MIT license <https://opensource.org/licenses/MIT>.
 #
 # Send QUIC packets which should solicit Version Negotiation packets. Multiple
 # servers and started in parallel, cases are started with small delays in
@@ -18,6 +18,13 @@
 # Probe a single server with large VN packets, skip retries on read timeout:
 #
 #   ./probe_quic_versions.py -s quant.eggert.org:4433 --retries 1 -c '1a*'
+#
+# In an earlier QUANT version, it would crash and restart after a delay. As
+# workaround, probe all but treat one specially:
+#
+#   ./probe_quic_versions.py --json -s all -s-quant.eggert.org:4433 > 1.json
+#   ./probe_quic_versions.py --json -s quant.eggert.org:4433 --retries 1 --delay 15 > 2.json
+#   jq -n '[inputs[]]' 1.json 2.json > probe-results.json
 
 import argparse
 import asyncio
@@ -26,23 +33,27 @@ import json
 import socket
 
 # Sampled from https://github.com/quicwg/base-drafts/wiki/Implementations
+# Pandora (unreachable) and QUICKer (unmaintained?) have been omitted.
+# The QUANT test server restarts 10 seconds after the last open connection or
+# crash, so try --delay 15 and disable retries (--retries 1) if needed.
 default_servers = [
-    'quic.aiortc.org:443',
-    'quic.ogre.com:4433',
-    'quic.rocks:4433',
-    'f5quic.com:4433',
-    'mew.org:4433',
-    'http3-test.litespeedtech.com:4433',
-    'quic.westus.cloudapp.azure.com:4433',
-    'fb.mvfst.net:443',
-    'nghttp2.org:4433',
-    'cloudflare-quic.com:443',
-    'test.privateoctopus.com:4433',
-    'quant.eggert.org:4433',
-    'quic.tech:4433',
-    'quicker.edm.uhasselt.be:4433',
-    'quic.examp1e.net:4433',
-    'ietf.akaquic.com:443',
+    'quic.aiortc.org:443',                      # aioquic
+    'quic.ogre.com:4433',                       # Apple Traffic Server (ats)
+    'quic.rocks:4433',                          # Chromium
+    'f5quic.com:4433',                          # f5
+    'mew.org:4433',                             # Haskell quic
+    'http3-test.litespeedtech.com:4433',        # Litespeed QUIC (lsquic)
+    'quic.westus.cloudapp.azure.com:4433',      # MsQuic
+    'fb.mvfst.net:443',                         # mvfst by Facebook
+    'nghttp2.org:4433',                         # nghttp2
+    'cloudflare-quic.com:443',                  # ngx_quic
+    'test.privateoctopus.com:4433',             # picoquic
+    'quant.eggert.org:4433',                    # QUANT (needs --delay 15)
+    'quic.tech:4433',                           # quiche
+    'quic.examp1e.net:4433',                    # quicly for H20 server
+    'h3.stammw.eu:443',                         # quinn (rust implementation)
+    'interop.seemann.io:443',                   # quic-go
+    'ietf.akaquic.com:443',                     # Akamai QUIC
 ]
 
 
@@ -198,7 +209,7 @@ async def run_probes(servers, probes, delay, retries, read_timeout):
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-s', '--server', metavar='HOST:PORT', dest='servers', action='append',
-                    help='Servers to check, "all" for some predefined ones, "help" to list all and exit')
+                    help='Servers to check, "all" for some predefined ones, "help" to list all and exit. Prefix by "-" to remove an earlier item (e.g. added by "all")')
 parser.add_argument('-c', '--case', metavar='CASE', dest='cases', action='append',
                     help='Override the cases to check, wildcards ("*" and "?") are supported. "help" to list all and exit')
 parser.add_argument('-r', '--read-json', metavar='file.json', type=argparse.FileType('r'),
@@ -216,14 +227,21 @@ parser.add_argument('--read-timeout', metavar='SECS', type=float, default=1.0,
 async def main():
     args = parser.parse_args()
 
-    servers = args.servers
-    if servers:
-        if servers == ['all']:
-            servers = default_servers
-        elif servers == ['help']:
-            for s in default_servers:
-                print(s)
-            return
+    servers = []
+    if args.servers:
+        for server_arg in args.servers:
+            if server_arg.startswith('-'):
+                servers.remove(server_arg[1:])
+            elif server_arg == 'help':
+                for s in default_servers:
+                    print(s)
+                return
+            elif server_arg == 'all':
+                for s in default_servers:
+                    if not s in servers:
+                        servers.append(s)
+            elif not server_arg in servers:
+                servers.append(server_arg)
 
     probes = get_probes()
     all_cases = [probe_type for probe_type, pkt in probes]

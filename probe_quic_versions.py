@@ -25,9 +25,14 @@
 #   ./probe_quic_versions.py --json -s all -s-quant.eggert.org:4433 > 1.json
 #   ./probe_quic_versions.py --json -s quant.eggert.org:4433 --retries 1 --delay 15 > 2.json
 #   jq -n '[inputs[]]' 1.json 2.json > probe-results.json
+#
+# Save yourself some time and fold common cases per server:
+#
+#   ./probe_quic_versions.py -r probe-results.json --summarize
 
 import argparse
 import asyncio
+import collections
 import fnmatch
 import json
 import socket
@@ -153,14 +158,21 @@ class Result:
         self.versions = versions
         self.error = error
 
-    def __str__(self):
+    def copy(self):
+        return Result(self.server, self.case, versions=self.versions,
+                      error=self.error)
+
+    def summary(self):
         if self.versions:
             text = f'Versions: {self.versions}'
         elif self.error == 'timeout':
             text = 'timeout'
         else:
             text = f'invalid: {self.error}'
-        return f'{self.server:38} - {self.case} - {text}'
+        return text
+
+    def __str__(self):
+        return f'{self.server} - {self.case} - {self.summary()}'
 
     def to_json(self):
         obj = {
@@ -179,6 +191,54 @@ class Result:
             return cls(o['server'], o['case'], versions=o['versions'])
         else:
             return cls(o['server'], o['case'], error=o['error'])
+
+
+def group_results(all_results):
+    new_results = []
+    # Split all results per server (server -> list of results)
+    results_by_server = {}
+    for result in all_results:
+        results_by_server.setdefault(result.server, []).append(result)
+    # Merge cases with the same results.
+    for results in results_by_server.values():
+        buckets = {}
+        for result in results:
+            new_result = buckets.get(result.summary())
+            if new_result:
+                if type(new_result.case) != list:
+                    new_result.case = [new_result.case]
+                new_result.case.append(result.case)
+            else:
+                buckets[result.summary()] = result.copy()
+        new_results += buckets.values()
+    # Compress case descriptions assuming patterns from get_probes: the first
+    # two chars mark the version, remaining chars the header type.
+    for result in new_results:
+        if type(result.case) == list:
+            result.case = fold_cases(result.case)
+    return new_results
+
+
+def fold_cases(case_names):
+    '''Fold a list of unique case names into one string.'''
+    # Convert into a list of (version, header_type)
+    tuples = [(name[:2], name[2:]) for name in case_names]
+    # Find words with multiple occurrences
+    for i in range(2):
+        word_counts = collections.Counter(x[i] for x in tuples)
+        words = [word for word, count in word_counts.items() if count > 1]
+        for word in words:
+            other_words = sorted(x[1-i] for x in tuples if x[i] == word)
+            if i == 0:
+                def join_word(x, other): return (x, other)
+            else:
+                def join_word(x, other): return (other, x)
+            tuples.insert(0, join_word(word, '{%s}' % ','.join(other_words)))
+            for other_word in other_words:
+                tuples.remove(join_word(word, other_word))
+    # Sort by versions
+    tuples.sort(key=lambda t: t[0].replace('{', ''))
+    return ' '.join('%s%s' % t for t in tuples)
 
 
 async def summarize_result(who, what, aresult):
@@ -216,6 +276,8 @@ parser.add_argument('-r', '--read-json', metavar='file.json', type=argparse.File
                     help='Read and summarize a previous JSON report. "-" for stdin')
 parser.add_argument('--json', action='store_true',
                     help='Output results in JSON format')
+parser.add_argument('--summarize', action='store_true',
+                    help='Try to condense output by merging similar cases for a server')
 parser.add_argument('--retries', type=int, default=3,
                     help='Maximum retries on timeout (default %(default)d)')
 parser.add_argument('--delay', metavar='SECS', type=float, default=.3,
@@ -278,8 +340,16 @@ async def main():
         jresults = [result.to_json() for result in results]
         print(json.dumps(jresults, indent=4))
     else:
-        for result in results:
-            print(result)
+        if args.summarize:
+            results = group_results(results)
+        rows = [[r.server, r.case, r.summary()] for r in results]
+        # Add one more space at the right and align up to a multiple of four.
+        colsize = [max(len(c) for c in col) for col in list(zip(*rows))[:-1]]
+        colsize = [(size + 4) // 4 * 4 for size in colsize]
+        for row in rows:
+            for i, size in enumerate(colsize):
+                row[i] = row[i].ljust(size)
+            print('- '.join(row))
 
 
 if __name__ == '__main__':
